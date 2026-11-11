@@ -1,20 +1,17 @@
 --[[
-	Hypershot — NYX build
+	Hypershot — NYX build v2 (Rayfield)
 	Game: "Hypershot!" by Frosted Studio
 	Places: Main 17516596118 | Mobile 131008473296170 | GunGame 122181485177067
 	        MainForNewPlayers 100040622766961
 
-	Everything here is readable on purpose. No key, no loadstring chain, no obfuscation.
-	Toggle panel with RIGHT SHIFT. Panic with DELETE.
+	v2 changes
+	  - Rayfield interface (Gen2 source first, official Rayfield as fallback)
+	  - aim core rewritten: mouse-delta feedback loop instead of raw CFrame writes,
+	    so the game drives the camera and there is nothing to fight. sticky target
+	    selection uses hysteresis + a keep-window + a LOS grace, not a 0.35s timer.
+	  - every slider is live, nothing needs a restart.
 
-	Notes that matter:
-	  - Hypershot fills lobbies with bots that carry real-looking names. Anything that is not
-	    in Players:GetPlayers() is tagged [BOT]; real players are tagged [P].
-	  - Health is 200 by default, so the health bar is normalised against Humanoid.MaxHealth.
-	  - Spawn protection is detected from attributes/tags whose name mentions spawn/immune/
-	    protect, plus the game's own "SpawnProtection" style tags when they exist.
-	  - Hitbox expander is client-side. Hypershot validates hits on the server for most
-	    weapons, so treat it as an aid, not a guarantee.
+	Panic: DELETE. Rayfield hides with its own key (K by default).
 ]]
 
 if getgenv().NYX_HYPERSHOT then
@@ -26,7 +23,6 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -51,50 +47,51 @@ local CFG = {
 		name = true,
 		health = true,
 		distance = true,
-		weapon = false,
 		tracer = false,
-		headDot = false,
 		chams = false,
 		bots = true,
 		teamCheck = true,
-		maxDistance = 3000,
+		maxDistance = 2500,
 	},
-
 	aim = {
-		enabled = false,
-		key = Enum.UserInputType.MouseButton2,
-		fov = 90,
-		smoothing = 0.35, -- 0 = instant snap, 1 = sluggish
-		part = "Head",    -- "Head" | "Torso" | "Nearest"
+		enabled = true,
+		mode = "Hold",          -- Hold | Toggle
+		method = "Mouse",       -- Mouse (mouse deltas) | Camera (raw CFrame)
+		key = "Right Mouse",
+		fov = 110,
+		smoothness = 55,        -- 0 = raw, 100 = very soft
+		maxStep = 26,           -- pixels per tick ceiling, mouse mode
+		stick = 0.7,            -- keep-window multiplier on top of the fov
+		switchMargin = 0.22,    -- a new target must be this much closer to steal the lock
+		grace = 0.55,           -- seconds the lock survives a lost target
+		part = "Head",
 		visibleOnly = true,
-		sticky = true,
-		mode = "Camera",  -- "Camera" | "Mouse"
+		predict = 0.035,
+		circle = true,
 	},
-
 	trigger = {
 		enabled = false,
-		fovPixels = 14,
-		delay = 0.05,
+		fovPixels = 12,
+		delay = 0.06,
 		visibleOnly = true,
 	},
-
 	hitbox = {
 		enabled = false,
 		scale = 1.8,
 	},
-
-	walkSpeed = 32,
-	exitWalkSpeed = 16,
+	speed = {
+		enabled = false,
+		value = 32,
+	},
 }
 
 local COL = {
 	box = Color3.fromRGB(255, 255, 255),
-	bot = Color3.fromRGB(255, 128, 64),
-	team = Color3.fromRGB(80, 200, 255),
-	name = Color3.fromRGB(235, 235, 235),
-	health = Color3.fromRGB(90, 220, 120),
-	distance = Color3.fromRGB(200, 200, 200),
-	chams = Color3.fromRGB(255, 60, 90),
+	bot = Color3.fromRGB(255, 132, 66),
+	name = Color3.fromRGB(238, 238, 242),
+	health = Color3.fromRGB(96, 222, 128),
+	distance = Color3.fromRGB(196, 196, 204),
+	chams = Color3.fromRGB(255, 62, 96),
 	fov = Color3.fromRGB(255, 255, 255),
 }
 
@@ -103,68 +100,59 @@ local COL = {
 -- ============================================================================
 
 local STATE = {
-	targets = {},       -- server-side actor models
-	targetSet = {},     -- same actors, keyed for O(1) lookups
-	drawing = {},       -- [actor] = { Square, Text, Line, Circle }
-	chams = {},         -- [actor] = Highlight
-	hitboxSizes = {},   -- [part] = original Size
+	targets = {},
+	targetSet = {},
+	target = nil,
+	point = nil,
+	lastSeen = 0,
+	lastLos = {},          -- [actor] = { t = number, ok = boolean }
+	drawing = {},          -- [actor] = { box, name, distance, health, tracer, dot }
+	chams = {},            -- [actor] = Highlight
+	hitboxSizes = {},
 	held = false,
-	stickActor = nil,
-	stickUntil = 0,
+	toggled = false,
 	lastTrigger = 0,
-	lastHitboxSweep = 0,
-	serial = 0,         -- re-entrancy guard for the refresh loop
+	lastSweep = 0,
+	firing = false,
+	fovCircle = nil,
+	alive = true,
 }
 
 local function note(text)
 	pcall(function()
-		print("[nyx-hypershot] " .. text)
+		print("[nyx-hypershot] " .. tostring(text))
 	end)
 end
 
 local function alive(actor)
-	local hum = actor and actor:FindFirstChildOfClass("Humanoid")
-	if not hum then
+	if not actor or not actor.Parent then
 		return false
 	end
-	if hum.Health <= 0 then
-		return false
-	end
-	if actor.Parent == nil then
-		return false
-	end
-	return true
+	local hum = actor:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0
 end
 
-local function root(actor)
-	return actor and (actor:FindFirstChild("HumanoidRootPart") or actor:FindFirstChild("UpperTorso") or actor:FindFirstChild("Head"))
+local function bodyOf(actor)
+	return actor and (actor:FindFirstChild("HumanoidRootPart")
+		or actor:FindFirstChild("UpperTorso")
+		or actor:FindFirstChild("Head"))
 end
 
 local function isBot(actor)
-	if actor:IsA("Player") then
-		return false
-	end
-	local plr = Players:GetPlayerFromCharacter(actor)
-	return plr == nil
+	return Players:GetPlayerFromCharacter(actor) == nil
 end
 
 local function sameTeam(actor)
-	if not CFG.esp.teamCheck then
-		return false
-	end
 	local mine = LocalPlayer.Team
-	if not mine or mine == "" then
+	if not CFG.esp.teamCheck or not mine or mine == "" then
 		return false
 	end
-	local theirs = nil
 	local plr = Players:GetPlayerFromCharacter(actor)
 	if plr then
-		theirs = plr.Team
-	elseif actor:IsA("Model") then
-		local tag = actor:GetAttribute("Team") or actor:GetAttribute("team")
-		theirs = tag
+		return plr.Team == mine
 	end
-	return theirs ~= nil and theirs == mine
+	local tag = actor:GetAttribute("Team") or actor:GetAttribute("team")
+	return tag ~= nil and tag == mine
 end
 
 local function protected(actor)
@@ -173,8 +161,7 @@ local function protected(actor)
 		if container then
 			for name, value in pairs(container:GetAttributes()) do
 				local key = string.lower(name)
-				if (string.find(key, "spawn") or string.find(key, "immune") or string.find(key, "protect"))
-					and value then
+				if value and (string.find(key, "spawn") or string.find(key, "immune") or string.find(key, "protect")) then
 					return true
 				end
 			end
@@ -194,17 +181,17 @@ end
 -- ============================================================================
 
 local function collect()
-	local out, seen = {}, {}
-	STATE.targets = out
+	local out, set = {}, {}
+	STATE.targets, STATE.targetSet = out, set
 
 	local function push(actor)
-		if seen[actor] or actor == LocalPlayer.Character then
+		if set[actor] or actor == LocalPlayer.Character then
 			return
 		end
 		if not alive(actor) or sameTeam(actor) then
 			return
 		end
-		seen[actor] = true
+		set[actor] = true
 		out[#out + 1] = actor
 	end
 
@@ -214,7 +201,6 @@ local function collect()
 		end
 	end
 
-	-- Bots live outside Players. Characters are parented to workspace or a folder in it.
 	for _, obj in ipairs(workspace:GetChildren()) do
 		if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
 			push(obj)
@@ -226,12 +212,292 @@ local function collect()
 			end
 		end
 	end
-
-	STATE.targetSet = seen
 end
 
 -- ============================================================================
--- drawing helpers
+-- projection and visibility
+-- ============================================================================
+
+local function project(position)
+	if not camera then
+		return nil
+	end
+	local point, onScreen = camera:WorldToViewportPoint(position)
+	if not onScreen or point.Z <= 0 then
+		return nil
+	end
+	return Vector2.new(point.X, point.Y)
+end
+
+local function rayClear(actor, worldPos)
+	local origin = camera.CFrame.Position
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LocalPlayer.Character, actor, camera }
+	params.IgnoreWater = true
+	return workspace:Raycast(origin, worldPos - origin, params) == nil
+end
+
+-- cached for a few frames so a railing does not make the lock strobe
+local function losOk(actor, point, now)
+	local cached = STATE.lastLos[actor]
+	if cached and now - cached.t < 0.1 then
+		return cached.ok
+	end
+	local ok = (not CFG.aim.visibleOnly) or rayClear(actor, point)
+	STATE.lastLos[actor] = { t = now, ok = ok }
+	return ok
+end
+
+-- ============================================================================
+-- aim core
+-- ============================================================================
+
+local function aimPoint(actor)
+	local head = actor:FindFirstChild("Head")
+	local body = actor:FindFirstChild("HumanoidRootPart")
+	local base
+
+	if CFG.aim.part == "Head" then
+		base = head and head.Position
+	elseif CFG.aim.part == "Torso" then
+		base = body and body.Position
+	else
+		if head and body then
+			local origin = camera.CFrame.Position
+			base = ((head.Position - origin).Magnitude <= (body.Position - origin).Magnitude)
+				and head.Position or body.Position
+		else
+			base = (head and head.Position) or (body and body.Position)
+		end
+	end
+
+	if not base then
+		return nil
+	end
+
+	if CFG.aim.predict > 0 and body then
+		base = base + body.AssemblyLinearVelocity * CFG.aim.predict
+	end
+	return base
+end
+
+local function screenOffset(point)
+	local sp = project(point)
+	if not sp or not camera then
+		return nil
+	end
+	return (sp - camera.ViewportSize / 2).Magnitude, sp
+end
+
+-- keeps the current body unless something is clearly better
+local function updateTarget(now)
+	local fov = CFG.aim.fov
+	local current = STATE.target
+
+	local bestActor, bestPoint, bestOffset = nil, nil, math.huge
+	for _, actor in ipairs(STATE.targets) do
+		if not protected(actor) then
+			local point = aimPoint(actor)
+			local offset = point and screenOffset(point)
+			if offset and offset <= fov and losOk(actor, point, now) then
+				if offset < bestOffset then
+					bestActor, bestPoint, bestOffset = actor, point, offset
+				end
+			end
+		end
+	end
+
+	if current and STATE.targetSet[current] and alive(current) and not protected(current) then
+		local point = aimPoint(current)
+		local offset = point and screenOffset(point)
+		local keep = fov * (1 + CFG.aim.stick)
+
+		if offset and offset <= keep then
+			local visible = losOk(current, point, now)
+			if visible then
+				STATE.lastSeen = now
+			end
+
+			local stale = (now - STATE.lastSeen) > CFG.aim.grace
+			local better = bestActor and bestActor ~= current and bestOffset < offset * (1 - CFG.aim.switchMargin)
+
+			if better or (stale and bestActor) then
+				STATE.target, STATE.point = bestActor, bestPoint
+				STATE.lastSeen = now
+				return
+			end
+
+			-- hold the lock; only feed a point the aim may actually pull toward
+			STATE.target = current
+			STATE.point = visible and point or nil
+			return
+		end
+	end
+
+	if bestActor then
+		STATE.target, STATE.point = bestActor, bestPoint
+		STATE.lastSeen = now
+	else
+		STATE.target, STATE.point = nil, nil
+	end
+end
+
+local function gainFromSmoothness()
+	-- 100 -> 0.06, 0 -> 0.85, exponential so the ends feel different
+	return 0.85 * (0.0706 ^ (math.clamp(CFG.aim.smoothness, 0, 100) / 100))
+end
+
+local function mouseAim(point, dt)
+	local sp = project(point)
+	if not sp or not camera then
+		return
+	end
+	-- with an unlocked cursor, mousemoverel would drag the pointer around the screen instead of turning
+	if UserInputService.MouseBehavior == Enum.MouseBehavior.Default then
+		return
+	end
+	local errorVector = sp - camera.ViewportSize / 2
+	local distance = errorVector.Magnitude
+	if distance < 1.2 then
+		return
+	end
+
+	local gain = gainFromSmoothness() * math.clamp(dt * 60, 0.35, 2)
+	local step = errorVector * math.clamp(gain, 0.01, 0.9)
+	local cap = CFG.aim.maxStep * math.clamp(dt * 60, 0.35, 2)
+	if step.Magnitude > cap then
+		step = step.Unit * cap
+	end
+
+	pcall(function()
+		mousemoverel(step.X, step.Y)
+	end)
+end
+
+local function cameraAim(point, dt)
+	local origin = camera.CFrame.Position
+	local delta = point - origin
+	if delta.Magnitude < 0.5 then
+		return
+	end
+	local dir = delta.Unit
+	local pitch = math.asin(math.clamp(dir.Y, -1, 1))
+	local yaw = math.atan2(-dir.X, -dir.Z)
+	local currentPitch, currentYaw = camera.CFrame:ToEulerAnglesYXZ()
+
+	local function wrap(a)
+		return (a + math.pi) % (2 * math.pi) - math.pi
+	end
+
+	local gain = math.clamp(gainFromSmoothness() * math.clamp(dt * 60, 0.35, 2), 0.01, 0.9)
+	local stepYaw = wrap(yaw - currentYaw) * gain
+	local stepPitch = wrap(pitch - currentPitch) * gain
+
+	-- never rotate more than ~22 degrees in one frame, keeps a reacquire from snapping
+	local limit = math.rad(22)
+	stepYaw = math.clamp(stepYaw, -limit, limit)
+	stepPitch = math.clamp(stepPitch, -limit, limit)
+
+	camera.CFrame = CFrame.new(origin) * CFrame.fromEulerAnglesYXZ(currentPitch + stepPitch, currentYaw + stepYaw, 0)
+end
+
+local function aiming()
+	if not CFG.aim.enabled then
+		return false
+	end
+	if CFG.aim.mode == "Toggle" then
+		return STATE.toggled
+	end
+	return STATE.held
+end
+
+local lastTick = os.clock()
+
+local function aimStep()
+	if not camera then
+		return
+	end
+	local now = os.clock()
+	local dt = math.clamp(now - lastTick, 0.001, 0.1)
+	lastTick = now
+
+	if not aiming() then
+		return
+	end
+
+	updateTarget(now)
+	if STATE.point then
+		if CFG.aim.method == "Camera" then
+			cameraAim(STATE.point, dt)
+		else
+			mouseAim(STATE.point, dt)
+		end
+	end
+end
+
+-- ============================================================================
+-- triggerbot
+-- ============================================================================
+
+local function crosshairPoint()
+	local center = camera.ViewportSize / 2
+	local best, bestOffset = nil, CFG.trigger.fovPixels
+
+	for _, actor in ipairs(STATE.targets) do
+		if not protected(actor) then
+			local point = aimPoint(actor)
+			local offset = point and screenOffset(point)
+			if offset and offset < bestOffset then
+				if not CFG.trigger.visibleOnly or losOk(actor, point, os.clock()) then
+					bestOffset = offset
+					best = point
+				end
+			end
+		end
+	end
+	return best, center
+end
+
+local function click()
+	if STATE.firing then
+		return
+	end
+	STATE.firing = true
+	task.spawn(function()
+		local ok = pcall(function()
+			mouse1press()
+			task.wait(0.025)
+			mouse1release()
+		end)
+		if not ok then
+			pcall(function()
+				local vim = game:GetService("VirtualInputManager")
+				vim:SendMouseButtonEvent(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2, 0, true, game, 1)
+				task.wait(0.025)
+				vim:SendMouseButtonEvent(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2, 0, false, game, 1)
+			end)
+		end
+		STATE.firing = false
+	end)
+end
+
+local function triggerStep()
+	if not CFG.trigger.enabled then
+		return
+	end
+	local now = os.clock()
+	if now - STATE.lastTrigger < CFG.trigger.delay then
+		return
+	end
+	if crosshairPoint() then
+		STATE.lastTrigger = now
+		click()
+	end
+end
+
+-- ============================================================================
+-- esp
 -- ============================================================================
 
 local function drawable(class, props)
@@ -242,10 +508,7 @@ local function drawable(class, props)
 		end
 		return d
 	end)
-	if ok then
-		return obj
-	end
-	return nil
+	return ok and obj or nil
 end
 
 local function layerFor(actor)
@@ -259,15 +522,14 @@ local function layerFor(actor)
 		distance = drawable("Text", { Size = 12, Center = true, Outline = true, Visible = false }),
 		health = drawable("Square", { Thickness = 0, Filled = true, Visible = false }),
 		tracer = drawable("Line", { Thickness = 1.2, Visible = false }),
-		dot = drawable("Circle", { Thickness = 1.4, NumSides = 14, Radius = 3, Filled = false, Visible = false }),
 	}
 	STATE.drawing[actor] = entry
 	return entry
 end
 
-local function hide(entry)
+local function hideLayer(entry)
 	for _, object in pairs(entry) do
-		if object and object.Destroy then
+		if object then
 			pcall(function()
 				object.Visible = false
 			end)
@@ -275,7 +537,7 @@ local function hide(entry)
 	end
 end
 
-local function destroy(entry)
+local function destroyLayer(entry)
 	for _, object in pairs(entry) do
 		if object and object.Destroy then
 			pcall(function()
@@ -285,105 +547,65 @@ local function destroy(entry)
 	end
 end
 
--- ============================================================================
--- projection
--- ============================================================================
-
-local function project(position)
-	if not camera then
-		return nil
-	end
-	local point, onScreen = camera:WorldToViewportPoint(position)
-	if not onScreen or point.Z <= 0 then
-		return nil
-	end
-	return Vector2.new(point.X, point.Y), point.Z
-end
-
-local function rayClear(actor, worldPos)
-	local origin = camera.CFrame.Position
-	local direction = worldPos - origin
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local ignore = { LocalPlayer.Character, actor }
-	if camera then
-		ignore[#ignore + 1] = camera
-	end
-	params.FilterDescendantsInstances = ignore
-	params.IgnoreWater = true
-	local result = workspace:Raycast(origin, direction * 1.02, params)
-	return result == nil
-end
-
--- ============================================================================
--- esp
--- ============================================================================
-
 local function renderESP()
 	if not CFG.esp.enabled then
-		for actor, entry in pairs(STATE.drawing) do
-			hide(entry)
+		for _, entry in pairs(STATE.drawing) do
+			hideLayer(entry)
 		end
 		return
 	end
 
-	local aliveSet = {}
-	local screenCenter = camera and camera.ViewportSize / 2 or Vector2.zero
+	local seen = {}
+	local center = camera.ViewportSize / 2
 
 	for _, actor in ipairs(STATE.targets) do
 		local entry = layerFor(actor)
-		aliveSet[actor] = true
+		seen[actor] = true
 
 		local head = actor:FindFirstChild("Head")
-		local body = root(actor)
+		local body = bodyOf(actor)
 		local hum = actor:FindFirstChildOfClass("Humanoid")
 		if not (head and body and hum) then
-			hide(entry)
+			hideLayer(entry)
 			continue
 		end
 
-		local origin = camera.CFrame.Position
-		local distance = (body.Position - origin).Magnitude
+		local distance = (body.Position - camera.CFrame.Position).Magnitude
 		if distance > CFG.esp.maxDistance then
-			hide(entry)
+			hideLayer(entry)
 			continue
 		end
 
-		local top = head.Position + Vector3.new(0, 0.55, 0)
-		local bottom = body.Position - Vector3.new(0, 2.5, 0)
-		local side = body.Position + camera.CFrame.RightVector * 1.2
-
-		local topScreen = project(top)
-		local bottomScreen = project(bottom)
-		local sideScreen = project(side)
-		local middleScreen = project(body.Position)
-
-		if not (topScreen and bottomScreen and sideScreen and middleScreen) then
-			hide(entry)
+		local bot = isBot(actor)
+		if bot and not CFG.esp.bots then
+			hideLayer(entry)
 			continue
 		end
 
-		local width = math.max(math.abs(sideScreen.X - middleScreen.X) * 2, 6)
+		local topScreen = project(head.Position + Vector3.new(0, 0.55, 0))
+		local bottomScreen = project(body.Position - Vector3.new(0, 2.5, 0))
+		local sideScreen = project(body.Position + camera.CFrame.RightVector * 1.2)
+		local midScreen = project(body.Position)
+		if not (topScreen and bottomScreen and sideScreen and midScreen) then
+			hideLayer(entry)
+			continue
+		end
+
+		local width = math.max(math.abs(sideScreen.X - midScreen.X) * 2, 6)
 		local height = math.abs(bottomScreen.Y - topScreen.Y)
 		if height < 4 then
-			hide(entry)
-			continue
-		end
-
-		local actorIsBot = isBot(actor)
-		if actorIsBot and not CFG.esp.bots then
-			hide(entry)
+			hideLayer(entry)
 			continue
 		end
 
 		local left = bottomScreen.X - width / 2
-		local y = math.min(topScreen.Y, bottomScreen.Y)
-		local color = actorIsBot and COL.bot or COL.box
+		local top = math.min(topScreen.Y, bottomScreen.Y)
+		local color = bot and COL.bot or COL.box
 
 		if CFG.esp.box and entry.box then
 			entry.box.Visible = true
 			entry.box.Color = color
-			entry.box.Position = Vector2.new(left, y)
+			entry.box.Position = Vector2.new(left, top)
 			entry.box.Size = Vector2.new(width, height)
 		elseif entry.box then
 			entry.box.Visible = false
@@ -394,40 +616,33 @@ local function renderESP()
 			entry.health.Visible = true
 			entry.health.Color = COL.health
 			entry.health.Size = Vector2.new(2, height * ratio)
-			entry.health.Position = Vector2.new(left - 6, y + (height - height * ratio))
+			entry.health.Position = Vector2.new(left - 6, top + (height - height * ratio))
 		elseif entry.health then
 			entry.health.Visible = false
 		end
 
 		if CFG.esp.name and entry.name then
-			local label = actorIsBot and (actor.Name .. " [BOT]") or (actor.Name .. " [P]")
 			local plr = Players:GetPlayerFromCharacter(actor)
-			if plr then
+			local label = plr and (plr.DisplayName .. " [P]") or (actor.Name .. " [BOT]")
+			if plr and not bot then
 				label = plr.DisplayName .. " [P]"
 			end
 			if protected(actor) then
-				label = label .. "  (spawn)"
+				label = label .. " (spawn)"
 			end
 			entry.name.Visible = true
-			entry.name.Color = actorIsBot and COL.bot or COL.name
+			entry.name.Color = bot and COL.bot or COL.name
 			entry.name.Text = label
-			entry.name.Position = Vector2.new(bottomScreen.X, y - 17)
+			entry.name.Position = Vector2.new(bottomScreen.X, top - 17)
 		elseif entry.name then
 			entry.name.Visible = false
 		end
 
 		if CFG.esp.distance and entry.distance then
-			local weapon = ""
-			if CFG.esp.weapon then
-				local tool = actor:FindFirstChildOfClass("Tool")
-				if tool then
-					weapon = " | " .. tool.Name
-				end
-			end
 			entry.distance.Visible = true
 			entry.distance.Color = COL.distance
-			entry.distance.Text = string.format("%d studs%s", math.floor(distance), weapon)
-			entry.distance.Position = Vector2.new(bottomScreen.X, y + height + 3)
+			entry.distance.Text = string.format("%d studs", math.floor(distance))
+			entry.distance.Position = Vector2.new(bottomScreen.X, top + height + 3)
 		elseif entry.distance then
 			entry.distance.Visible = false
 		end
@@ -435,31 +650,19 @@ local function renderESP()
 		if CFG.esp.tracer and entry.tracer then
 			entry.tracer.Visible = true
 			entry.tracer.Color = color
-			entry.tracer.From = Vector2.new(screenCenter.X, camera.ViewportSize.Y)
-			entry.tracer.To = Vector2.new(bottomScreen.X, y + height)
+			entry.tracer.From = Vector2.new(center.X, camera.ViewportSize.Y)
+			entry.tracer.To = Vector2.new(bottomScreen.X, top + height)
 		elseif entry.tracer then
 			entry.tracer.Visible = false
-		end
-
-		if CFG.esp.headDot and entry.dot then
-			entry.dot.Visible = true
-			entry.dot.Color = color
-			entry.dot.Position = topScreen
-		elseif entry.dot then
-			entry.dot.Visible = false
 		end
 	end
 
 	for actor, entry in pairs(STATE.drawing) do
-		if not aliveSet[actor] then
-			hide(entry)
+		if not seen[actor] then
+			hideLayer(entry)
 		end
 	end
 end
-
--- ============================================================================
--- chams
--- ============================================================================
 
 local function renderChams()
 	local keep = {}
@@ -468,19 +671,14 @@ local function renderChams()
 			keep[actor] = true
 			local highlight = STATE.chams[actor]
 			if not highlight or highlight.Parent ~= actor then
-				local existing = actor:FindFirstChild("NYX_Chams")
-				if existing then
-					highlight = existing
-				else
-					highlight = Instance.new("Highlight")
-					highlight.Name = "NYX_Chams"
-					highlight.Parent = actor
-				end
+				highlight = actor:FindFirstChild("NYX_Chams") or Instance.new("Highlight")
+				highlight.Name = "NYX_Chams"
 				highlight.FillColor = COL.chams
 				highlight.FillTransparency = 0.55
 				highlight.OutlineColor = COL.chams
 				highlight.OutlineTransparency = 0
 				highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				highlight.Parent = actor
 				STATE.chams[actor] = highlight
 			end
 		end
@@ -496,7 +694,7 @@ local function renderChams()
 end
 
 -- ============================================================================
--- hitbox expander
+-- hitbox
 -- ============================================================================
 
 local function restoreHitboxes()
@@ -508,19 +706,17 @@ local function restoreHitboxes()
 	STATE.hitboxSizes = {}
 end
 
-local function renderHitboxes()
+local function renderHitboxes(now)
 	if not CFG.hitbox.enabled then
 		if next(STATE.hitboxSizes) then
 			restoreHitboxes()
 		end
 		return
 	end
-
-	local now = os.clock()
-	if now - STATE.lastHitboxSweep < 0.5 then
+	if now - STATE.lastSweep < 0.5 then
 		return
 	end
-	STATE.lastHitboxSweep = now
+	STATE.lastSweep = now
 
 	local wanted = {}
 	for _, actor in ipairs(STATE.targets) do
@@ -546,484 +742,495 @@ local function renderHitboxes()
 end
 
 -- ============================================================================
--- aim
+-- loops
 -- ============================================================================
 
-local function aimPoint(actor)
-	local head = actor:FindFirstChild("Head")
-	local body = actor:FindFirstChild("HumanoidRootPart")
-
-	if CFG.aim.part == "Head" and head then
-		return head.Position
-	end
-	if CFG.aim.part == "Torso" and body then
-		return body.Position
-	end
-	if head and body then
-		local origin = camera.CFrame.Position
-		return ((head.Position - origin).Magnitude < (body.Position - origin).Magnitude) and head.Position or body.Position
-	end
-	return head and head.Position or (body and body.Position)
-end
-
-local function pickTarget()
-	if not camera then
-		return nil
-	end
-	local viewport = camera.ViewportSize
-	local center = viewport / 2
-	local best, bestScore = nil, math.huge
-	local fov = CFG.aim.fov
-
-	-- sticky: hold the last target for a beat so the crosshair does not jitter between two bodies
-	if CFG.aim.sticky and STATE.stickActor and os.clock() < STATE.stickUntil then
-		local actor = STATE.stickActor
-		if STATE.targetSet[actor] and not protected(actor) then
-			local point = aimPoint(actor)
-			local screen = point and project(point)
-			if screen and (screen - center).Magnitude <= fov * 1.4 then
-				if not CFG.aim.visibleOnly or rayClear(actor, point) then
-					return point
-				end
-			end
-		end
-		STATE.stickActor = nil
-	end
-
-	for _, actor in ipairs(STATE.targets) do
-		if not protected(actor) then
-			local point = aimPoint(actor)
-			if point then
-				local screen = project(point)
-				if screen then
-					local offset = (screen - center).Magnitude
-					if offset <= fov then
-						if CFG.aim.visibleOnly and not rayClear(actor, point) then
-							continue
-						end
-						if offset < bestScore then
-							bestScore = offset
-							best = point
-							STATE.stickActor = actor
-							STATE.stickUntil = os.clock() + 0.35
-						end
-					end
-				end
-			end
-		end
-	end
-	return best
-end
-
-local function driveAim()
-	if not CFG.aim.enabled or not STATE.held then
+RunService.RenderStepped:Connect(function()
+	if not STATE.alive or not camera then
 		return
 	end
-	local point = pickTarget()
-	if not point then
-		return
-	end
+	collect()
+	renderESP()
+	renderChams()
+	renderHitboxes(os.clock())
+	triggerStep()
 
-	if CFG.aim.mode == "Mouse" then
-		local screen = project(point)
-		if not screen then
-			return
+	if STATE.fovCircle then
+		if CFG.aim.circle and CFG.aim.enabled then
+			STATE.fovCircle.Visible = true
+			STATE.fovCircle.Position = camera.ViewportSize / 2
+			STATE.fovCircle.Radius = CFG.aim.fov
+			STATE.fovCircle.Color = COL.fov
+		else
+			STATE.fovCircle.Visible = false
 		end
-		local delta = screen - camera.ViewportSize / 2
-		local factor = 1 - math.clamp(CFG.aim.smoothing, 0, 0.95)
-		pcall(function()
-			mousemoverel(delta.X * factor * 0.35, delta.Y * factor * 0.35)
-		end)
-		return
 	end
+end)
 
-	local goal = CFrame.lookAt(camera.CFrame.Position, point)
-	local alpha = 1 - math.clamp(CFG.aim.smoothing, 0, 0.98)
-	camera.CFrame = camera.CFrame:Lerp(goal, math.clamp(alpha, 0.02, 1))
-end
-
--- camera priority so the game does not overwrite our rotation on the same frame
 pcall(function()
 	RunService:UnbindFromRenderStep("NYX_Aim")
 end)
-RunService:BindToRenderStep("NYX_Aim", Enum.RenderPriority.Camera.Value + 1, driveAim)
-
--- ============================================================================
--- triggerbot
--- ============================================================================
-
-local function crosshairTarget()
-	if not camera then
-		return nil
-	end
-	local center = camera.ViewportSize / 2
-	local best, bestScore = nil, CFG.trigger.fovPixels
-
-	for _, actor in ipairs(STATE.targets) do
-		if not protected(actor) then
-			local point = aimPoint(actor)
-			local screen = point and project(point)
-			if screen then
-				local offset = (screen - center).Magnitude
-				if offset < bestScore then
-					if not CFG.trigger.visibleOnly or rayClear(actor, point) then
-						bestScore = offset
-						best = point
-					end
-				end
-			end
-		end
-	end
-	return best
-end
-
-local function fire()
-	local ok = pcall(function()
-		mouse1press()
-		task.wait(0.03)
-		mouse1release()
-	end)
-	if not ok then
-		local vim = game:GetService("VirtualInputManager")
-		pcall(function()
-			vim:SendMouseButtonEvent(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2, 0, true, game, 1)
-			task.wait(0.03)
-			vim:SendMouseButtonEvent(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2, 0, false, game, 1)
-		end)
-	end
-end
-
-local function pollTrigger()
-	if not CFG.trigger.enabled then
-		return
-	end
-	local now = os.clock()
-	if now - STATE.lastTrigger < CFG.trigger.delay then
-		return
-	end
-	if crosshairTarget() then
-		STATE.lastTrigger = now
-		fire()
-	end
-end
-
--- ============================================================================
--- movement
--- ============================================================================
-
-local function applySpeed(value)
-	local char = LocalPlayer.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if hum then
-		hum.WalkSpeed = value
-	end
-end
-
--- ============================================================================
--- loop
--- ============================================================================
-
-RunService.RenderStepped:Connect(function()
-	local serial = STATE.serial + 1
-	STATE.serial = serial
-	if not camera then
-		return
-	end
-	if serial % 2 == 0 then
-		collect()
-	end
-	renderESP()
-	renderChams()
-	renderHitboxes()
-end)
-
-task.spawn(function()
-	while true do
-		local ok, err = pcall(pollTrigger)
-		if not ok then
-			note("trigger: " .. tostring(err))
-		end
-		task.wait(0.02)
-	end
-end)
-
--- ============================================================================
--- fov circle
--- ============================================================================
-
-local fovCircle = drawable("Circle", { Thickness = 1.3, NumSides = 48, Filled = false, Visible = false })
-
-RunService.RenderStepped:Connect(function()
-	if not fovCircle then
-		return
-	end
-	if CFG.aim.enabled and camera then
-		fovCircle.Visible = true
-		fovCircle.Position = camera.ViewportSize / 2
-		fovCircle.Radius = CFG.aim.fov
-		fovCircle.Color = COL.fov
-	else
-		fovCircle.Visible = false
-	end
-end)
+RunService:BindToRenderStep("NYX_Aim", Enum.RenderPriority.Camera.Value + 1, aimStep)
 
 -- ============================================================================
 -- input
 -- ============================================================================
 
-UserInputService.InputBegan:Connect(function(input, processed)
-	if input.UserInputType == CFG.aim.key then
-		STATE.held = true
-	elseif input.KeyCode == Enum.KeyCode.Delete then
+local KEY_MAP = {
+	["Right Mouse"] = Enum.UserInputType.MouseButton2,
+	["Left Mouse"] = Enum.UserInputType.MouseButton1,
+	["Middle Mouse"] = Enum.UserInputType.MouseButton3,
+	["Left Shift"] = Enum.KeyCode.LeftShift,
+	["Q"] = Enum.KeyCode.Q,
+	["E"] = Enum.KeyCode.E,
+	["C"] = Enum.KeyCode.C,
+}
+
+local function matches(input, target)
+	if typeof(target) == "EnumItem" then
+		return input.UserInputType == target or input.KeyCode == target
+	end
+	return false
+end
+
+UserInputService.InputBegan:Connect(function(input)
+	local key = KEY_MAP[CFG.aim.key]
+	if key and matches(input, key) then
+		if CFG.aim.mode == "Toggle" then
+			STATE.toggled = not STATE.toggled
+		else
+			STATE.held = true
+		end
+	end
+	if input.KeyCode == Enum.KeyCode.Delete then
 		if getgenv().NYX_HYPERSHOT then
 			getgenv().NYX_HYPERSHOT.panic()
-		end
-	elseif input.KeyCode == Enum.KeyCode.RightShift then
-		if getgenv().NYX_HYPERSHOT and getgenv().NYX_HYPERSHOT.togglePanel then
-			getgenv().NYX_HYPERSHOT.togglePanel()
 		end
 	end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == CFG.aim.key then
+	local key = KEY_MAP[CFG.aim.key]
+	if key and matches(input, key) and CFG.aim.mode ~= "Toggle" then
 		STATE.held = false
 	end
 end)
 
 -- ============================================================================
--- panel
+-- interface
 -- ============================================================================
 
-local function buildPanel()
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "NYX_Hypershot"
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	gui.DisplayOrder = 999
-	gui.Parent = (function()
-		local ok, core = pcall(function()
-			return game:GetService("CoreGui")
+local SOURCES = {
+	"https://raw.githubusercontent.com/SyncOfficialSpec/Rayfield_Gen_2_fanmade/refs/heads/main/source.lua",
+	"https://sirius.menu/rayfield",
+	"https://raw.githubusercontent.com/sirius-menu/rayfield/refs/heads/main/source.lua",
+}
+
+local function loadRayfield()
+	for _, url in ipairs(SOURCES) do
+		local ok, library = pcall(function()
+			local body = game:HttpGet(url)
+			local chunk = loadstring(body)
+			if not chunk then
+				error("compile failed")
+			end
+			local value = chunk()
+			if type(value) ~= "table" and type(value) ~= "userdata" then
+				error("bad return")
+			end
+			return value
 		end)
-		return ok and core or LocalPlayer:WaitForChild("PlayerGui")
-	end)()
-
-	local frame = Instance.new("Frame")
-	frame.Size = UDim2.fromOffset(232, 396)
-	frame.Position = UDim2.fromOffset(40, 120)
-	frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
-	frame.BackgroundTransparency = 0.08
-	frame.BorderSizePixel = 0
-	frame.Active = true
-	frame.Parent = gui
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 6)
-	corner.Parent = frame
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(70, 70, 84)
-	stroke.Thickness = 1
-	stroke.Parent = frame
-
-	local title = Instance.new("TextLabel")
-	title.Size = UDim2.new(1, 0, 0, 30)
-	title.BackgroundTransparency = 1
-	title.Font = Enum.Font.GothamMedium
-	title.Text = "hypershot"
-	title.TextColor3 = Color3.fromRGB(240, 240, 245)
-	title.TextSize = 14
-	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Position = UDim2.fromOffset(12, 0)
-	title.Active = true
-	title.Parent = frame
-
-	local hint = Instance.new("TextLabel")
-	hint.Size = UDim2.new(1, -24, 0, 14)
-	hint.BackgroundTransparency = 1
-	hint.Font = Enum.Font.Gotham
-	hint.Text = "rshift hide  ·  del panic"
-	hint.TextColor3 = Color3.fromRGB(110, 110, 126)
-	hint.TextSize = 11
-	hint.TextXAlignment = Enum.TextXAlignment.Left
-	hint.Position = UDim2.fromOffset(12, 26)
-	hint.Parent = frame
-
-	local list = Instance.new("Frame")
-	list.Size = UDim2.new(1, -20, 1, -60)
-	list.Position = UDim2.fromOffset(10, 44)
-	list.BackgroundTransparency = 1
-	list.Parent = frame
-
-	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 3)
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Parent = list
-
-	local function row(text, getter, setter)
-		local button = Instance.new("TextButton")
-		button.Size = UDim2.new(1, 0, 0, 22)
-		button.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-		button.BackgroundTransparency = 0
-		button.AutoButtonColor = true
-		button.BorderSizePixel = 0
-		button.Font = Enum.Font.Gotham
-		button.TextSize = 12
-		button.TextXAlignment = Enum.TextXAlignment.Left
-		button.Parent = list
-
-		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 8)
-		pad.Parent = button
-
-		local function refresh()
-			local on = getter()
-			button.Text = (on and "● " or "○ ") .. text
-			button.TextColor3 = on and Color3.fromRGB(120, 220, 160) or Color3.fromRGB(150, 150, 165)
+		if ok and library then
+			note("interface: " .. url)
+			return library
 		end
-
-		button.MouseButton1Click:Connect(function()
-			setter(not getter())
-			refresh()
-		end)
-		refresh()
-		return button
+		note("interface failed: " .. url)
 	end
-
-	row("esp", function()
-		return CFG.esp.enabled
-	end, function(value)
-		CFG.esp.enabled = value
-	end)
-	row("boxes", function()
-		return CFG.esp.box
-	end, function(value)
-		CFG.esp.box = value
-	end)
-	row("names + bot tags", function()
-		return CFG.esp.name
-	end, function(value)
-		CFG.esp.name = value
-	end)
-	row("health bars", function()
-		return CFG.esp.health
-	end, function(value)
-		CFG.esp.health = value
-	end)
-	row("tracers", function()
-		return CFG.esp.tracer
-	end, function(value)
-		CFG.esp.tracer = value
-	end)
-	row("chams", function()
-		return CFG.esp.chams
-	end, function(value)
-		CFG.esp.chams = value
-	end)
-	row("aim assist (rmb)", function()
-		return CFG.aim.enabled
-	end, function(value)
-		CFG.aim.enabled = value
-	end)
-	row("visible only", function()
-		return CFG.aim.visibleOnly
-	end, function(value)
-		CFG.aim.visibleOnly = value
-	end)
-	row("triggerbot", function()
-		return CFG.trigger.enabled
-	end, function(value)
-		CFG.trigger.enabled = value
-	end)
-	row("hitbox expander", function()
-		return CFG.hitbox.enabled
-	end, function(value)
-		CFG.hitbox.enabled = value
-	end)
-
-	local fovRow = Instance.new("Frame")
-	fovRow.Size = UDim2.new(1, 0, 0, 22)
-	fovRow.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-	fovRow.BorderSizePixel = 0
-	fovRow.Parent = list
-
-	local fovLabel = Instance.new("TextLabel")
-	fovLabel.Size = UDim2.new(1, -70, 1, 0)
-	fovLabel.Position = UDim2.fromOffset(8, 0)
-	fovLabel.BackgroundTransparency = 1
-	fovLabel.Font = Enum.Font.Gotham
-	fovLabel.TextSize = 12
-	fovLabel.TextXAlignment = Enum.TextXAlignment.Left
-	fovLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
-	fovLabel.Parent = fovRow
-
-	local function fovText()
-		fovLabel.Text = "fov  " .. math.floor(CFG.aim.fov)
-	end
-	fovText()
-
-	local function stepper(label, offsetX, delta)
-		local button = Instance.new("TextButton")
-		button.Size = UDim2.fromOffset(22, 18)
-		button.Position = UDim2.new(1, offsetX, 0.5, -9)
-		button.BackgroundColor3 = Color3.fromRGB(38, 38, 48)
-		button.BorderSizePixel = 0
-		button.Font = Enum.Font.Gotham
-		button.TextSize = 12
-		button.TextColor3 = Color3.fromRGB(210, 210, 220)
-		button.Text = label
-		button.Parent = fovRow
-		button.MouseButton1Click:Connect(function()
-			CFG.aim.fov = math.clamp(CFG.aim.fov + delta, 10, 400)
-			fovText()
-		end)
-	end
-
-	stepper("-", -56, -10)
-	stepper("+", -30, 10)
-
-	-- drag
-	local dragging, startPos, startInput = false, nil, nil
-	title.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = true
-			startPos = frame.Position
-			startInput = input.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-				end
-			end)
-		end
-	end)
-	UserInputService.InputChanged:Connect(function(input)
-		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-			local delta = input.Position - startInput
-			frame.Position = UDim2.new(
-				startPos.X.Scale,
-				startPos.X.Offset + delta.X,
-				startPos.Y.Scale,
-				startPos.Y.Offset + delta.Y
-			)
-		end
-	end)
-
-	return gui, frame
+	return nil
 end
 
-local guiRoot, guiFrame = buildPanel()
+local Rayfield = loadRayfield()
+
+local function buildFallback()
+	-- no library at all: keep the cheat running, just expose the config through getgenv
+	note("no Rayfield available, running headless")
+	return nil
+end
+
+if Rayfield and Rayfield.CreateWindow then
+	local Window = Rayfield:CreateWindow({
+		Name = "hypershot",
+		Subtitle = "nyx",
+		Icon = 0,
+		LoadingTitle = "hypershot",
+		LoadingSubtitle = "nyx build v2",
+		Theme = "Default",
+		ConfigurationSaving = {
+			Enabled = true,
+			FolderName = "NYX",
+			FileName = "hypershot",
+		},
+		KeySystem = false,
+	})
+
+	local AimTab = Window:CreateTab("Aim")
+	local VisualTab = Window:CreateTab("Visuals")
+	local MiscTab = Window:CreateTab("Misc")
+
+	AimTab:CreateSection("Targeting")
+
+	AimTab:CreateToggle({
+		Name = "Aim assist",
+		CurrentValue = CFG.aim.enabled,
+		Flag = "aim_enabled",
+		Callback = function(value)
+			CFG.aim.enabled = value
+		end,
+	})
+
+	AimTab:CreateDropdown({
+		Name = "Activation",
+		Options = { "Hold", "Toggle" },
+		CurrentOption = { CFG.aim.mode },
+		Flag = "aim_mode",
+		Callback = function(option)
+			CFG.aim.mode = type(option) == "table" and option[1] or option
+			STATE.held = false
+			STATE.toggled = false
+		end,
+	})
+
+	AimTab:CreateDropdown({
+		Name = "Key",
+		Options = { "Right Mouse", "Left Mouse", "Middle Mouse", "Left Shift", "Q", "E", "C" },
+		CurrentOption = { CFG.aim.key },
+		Flag = "aim_key",
+		Callback = function(option)
+			CFG.aim.key = type(option) == "table" and option[1] or option
+			STATE.held = false
+			STATE.toggled = false
+		end,
+	})
+
+	AimTab:CreateDropdown({
+		Name = "Hit part",
+		Options = { "Head", "Torso", "Nearest" },
+		CurrentOption = { CFG.aim.part },
+		Flag = "aim_part",
+		Callback = function(option)
+			CFG.aim.part = type(option) == "table" and option[1] or option
+		end,
+	})
+
+	AimTab:CreateSection("Behaviour")
+
+	AimTab:CreateSlider({
+		Name = "FOV",
+		Range = { 10, 400 },
+		Increment = 5,
+		CurrentValue = CFG.aim.fov,
+		Suffix = "px",
+		Flag = "aim_fov",
+		Callback = function(value)
+			CFG.aim.fov = value
+		end,
+	})
+
+	AimTab:CreateSlider({
+		Name = "Smoothness",
+		Range = { 0, 100 },
+		Increment = 1,
+		CurrentValue = CFG.aim.smoothness,
+		Flag = "aim_smooth",
+		Callback = function(value)
+			CFG.aim.smoothness = value
+		end,
+	})
+
+	AimTab:CreateSlider({
+		Name = "Max step",
+		Range = { 2, 80 },
+		Increment = 1,
+		CurrentValue = CFG.aim.maxStep,
+		Suffix = "px",
+		Flag = "aim_step",
+		Callback = function(value)
+			CFG.aim.maxStep = value
+		end,
+	})
+
+	AimTab:CreateSlider({
+		Name = "Stickiness",
+		Range = { 0, 250 },
+		Increment = 5,
+		CurrentValue = math.floor(CFG.aim.stick * 100),
+		Suffix = "%",
+		Flag = "aim_stick",
+		Callback = function(value)
+			CFG.aim.stick = value / 100
+		end,
+	})
+
+	AimTab:CreateToggle({
+		Name = "Visible only",
+		CurrentValue = CFG.aim.visibleOnly,
+		Flag = "aim_visible",
+		Callback = function(value)
+			CFG.aim.visibleOnly = value
+			STATE.lastLos = {}
+		end,
+	})
+
+	AimTab:CreateToggle({
+		Name = "FOV circle",
+		CurrentValue = CFG.aim.circle,
+		Flag = "aim_circle",
+		Callback = function(value)
+			CFG.aim.circle = value
+		end,
+	})
+
+	AimTab:CreateToggle({
+		Name = "Use camera instead of mouse",
+		CurrentValue = CFG.aim.method == "Camera",
+		Flag = "aim_camera",
+		Callback = function(value)
+			CFG.aim.method = value and "Camera" or "Mouse"
+		end,
+	})
+
+	AimTab:CreateSlider({
+		Name = "Prediction",
+		Range = { 0, 200 },
+		Increment = 5,
+		CurrentValue = math.floor(CFG.aim.predict * 1000),
+		Suffix = "ms",
+		Flag = "aim_predict",
+		Callback = function(value)
+			CFG.aim.predict = value / 1000
+		end,
+	})
+
+	VisualTab:CreateSection("Players")
+
+	VisualTab:CreateToggle({
+		Name = "ESP",
+		CurrentValue = CFG.esp.enabled,
+		Flag = "esp_enabled",
+		Callback = function(value)
+			CFG.esp.enabled = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Boxes",
+		CurrentValue = CFG.esp.box,
+		Flag = "esp_box",
+		Callback = function(value)
+			CFG.esp.box = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Names + tags",
+		CurrentValue = CFG.esp.name,
+		Flag = "esp_name",
+		Callback = function(value)
+			CFG.esp.name = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Health",
+		CurrentValue = CFG.esp.health,
+		Flag = "esp_health",
+		Callback = function(value)
+			CFG.esp.health = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Distance",
+		CurrentValue = CFG.esp.distance,
+		Flag = "esp_distance",
+		Callback = function(value)
+			CFG.esp.distance = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Tracers",
+		CurrentValue = CFG.esp.tracer,
+		Flag = "esp_tracer",
+		Callback = function(value)
+			CFG.esp.tracer = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Chams",
+		CurrentValue = CFG.esp.chams,
+		Flag = "esp_chams",
+		Callback = function(value)
+			CFG.esp.chams = value
+		end,
+	})
+
+	VisualTab:CreateToggle({
+		Name = "Show bots",
+		CurrentValue = CFG.esp.bots,
+		Flag = "esp_bots",
+		Callback = function(value)
+			CFG.esp.bots = value
+		end,
+	})
+
+	VisualTab:CreateSlider({
+		Name = "Max distance",
+		Range = { 100, 5000 },
+		Increment = 100,
+		CurrentValue = CFG.esp.maxDistance,
+		Suffix = "studs",
+		Flag = "esp_range",
+		Callback = function(value)
+			CFG.esp.maxDistance = value
+		end,
+	})
+
+	MiscTab:CreateSection("Combat")
+
+	MiscTab:CreateToggle({
+		Name = "Triggerbot",
+		CurrentValue = CFG.trigger.enabled,
+		Flag = "trigger_enabled",
+		Callback = function(value)
+			CFG.trigger.enabled = value
+		end,
+	})
+
+	MiscTab:CreateSlider({
+		Name = "Trigger window",
+		Range = { 2, 60 },
+		Increment = 1,
+		CurrentValue = CFG.trigger.fovPixels,
+		Suffix = "px",
+		Flag = "trigger_window",
+		Callback = function(value)
+			CFG.trigger.fovPixels = value
+		end,
+	})
+
+	MiscTab:CreateSlider({
+		Name = "Trigger delay",
+		Range = { 0, 500 },
+		Increment = 5,
+		CurrentValue = math.floor(CFG.trigger.delay * 1000),
+		Suffix = "ms",
+		Flag = "trigger_delay",
+		Callback = function(value)
+			CFG.trigger.delay = value / 1000
+		end,
+	})
+
+	MiscTab:CreateSection("Player")
+
+	MiscTab:CreateToggle({
+		Name = "Hitbox expander",
+		CurrentValue = CFG.hitbox.enabled,
+		Flag = "hitbox_enabled",
+		Callback = function(value)
+			CFG.hitbox.enabled = value
+			if not value then
+				restoreHitboxes()
+			end
+		end,
+	})
+
+	MiscTab:CreateSlider({
+		Name = "Hitbox scale",
+		Range = { 10, 40 },
+		Increment = 1,
+		CurrentValue = math.floor(CFG.hitbox.scale * 10),
+		Suffix = "x",
+		Flag = "hitbox_scale",
+		Callback = function(value)
+			CFG.hitbox.scale = value / 10
+			restoreHitboxes()
+		end,
+	})
+
+	MiscTab:CreateToggle({
+		Name = "Walk speed",
+		CurrentValue = CFG.speed.enabled,
+		Flag = "speed_enabled",
+		Callback = function(value)
+			CFG.speed.enabled = value
+			local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+			if hum then
+				hum.WalkSpeed = value and CFG.speed.value or 16
+			end
+		end,
+	})
+
+	MiscTab:CreateSlider({
+		Name = "Speed value",
+		Range = { 16, 120 },
+		Increment = 2,
+		CurrentValue = CFG.speed.value,
+		Flag = "speed_value",
+		Callback = function(value)
+			CFG.speed.value = value
+			if CFG.speed.enabled then
+				local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				if hum then
+					hum.WalkSpeed = value
+				end
+			end
+		end,
+	})
+
+	MiscTab:CreateSection("Panic")
+
+	MiscTab:CreateButton({
+		Name = "Remove everything",
+		Callback = function()
+			if getgenv().NYX_HYPERSHOT then
+				getgenv().NYX_HYPERSHOT.panic()
+			end
+		end,
+	})
+
+	MiscTab:CreateLabel("DELETE also works as a panic key")
+
+	pcall(function()
+		Rayfield:LoadConfiguration()
+	end)
+else
+	buildFallback()
+end
+
+STATE.fovCircle = drawable("Circle", { Thickness = 1.3, NumSides = 48, Filled = false, Visible = false })
+
+-- ============================================================================
+-- panic
+-- ============================================================================
 
 local function panic()
+	STATE.alive = false
 	CFG.esp.enabled = false
 	CFG.aim.enabled = false
 	CFG.trigger.enabled = false
 	CFG.hitbox.enabled = false
+
 	restoreHitboxes()
-	applySpeed(CFG.exitWalkSpeed)
+
+	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.WalkSpeed = 16
+	end
 
 	for actor, entry in pairs(STATE.drawing) do
-		destroy(entry)
+		destroyLayer(entry)
 		STATE.drawing[actor] = nil
 	end
 	for actor, highlight in pairs(STATE.chams) do
@@ -1032,35 +1239,29 @@ local function panic()
 		end)
 		STATE.chams[actor] = nil
 	end
-	pcall(function()
-		if fovCircle then
-			fovCircle:Destroy()
-			fovCircle = nil
-		end
-	end)
+	if STATE.fovCircle then
+		pcall(function()
+			STATE.fovCircle:Destroy()
+		end)
+		STATE.fovCircle = nil
+	end
 	pcall(function()
 		RunService:UnbindFromRenderStep("NYX_Aim")
 	end)
 	pcall(function()
-		if guiRoot then
-			guiRoot:Destroy()
+		if Rayfield and Rayfield.Destroy then
+			Rayfield:Destroy()
 		end
 	end)
+
 	getgenv().NYX_HYPERSHOT = nil
-	note("panic — everything removed")
+	note("panic")
 end
 
 getgenv().NYX_HYPERSHOT = {
 	config = CFG,
+	state = STATE,
 	panic = panic,
-	togglePanel = function()
-		if guiFrame then
-			guiFrame.Visible = not guiFrame.Visible
-		end
-	end,
 }
 
--- default speed nudge, off unless you ask for it
--- applySpeed(CFG.walkSpeed)
-
-note("loaded — rshift panel, del panic")
+note("v2 loaded — aim is Hold + Right Mouse by default")
