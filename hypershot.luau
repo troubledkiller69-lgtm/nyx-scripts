@@ -1,15 +1,11 @@
 --[[
-	Hypershot — NYX build v2 (Rayfield)
+	Hypershot — NYX build v3 (Rayfield)
 	Game: "Hypershot!" by Frosted Studio
 	Places: Main 17516596118 | Mobile 131008473296170 | GunGame 122181485177067
 	        MainForNewPlayers 100040622766961
 
-	v2 changes
-	  - Rayfield interface (Gen2 source first, official Rayfield as fallback)
-	  - aim core rewritten: mouse-delta feedback loop instead of raw CFrame writes,
-	    so the game drives the camera and there is nothing to fight. sticky target
-	    selection uses hysteresis + a keep-window + a LOS grace, not a 0.35s timer.
-	  - every slider is live, nothing needs a restart.
+	v3: nearest-enemy acquisition, targeting preferences, persistent sticky lock,
+	shared teammate filters, rainbow visuals, throttled discovery and full cleanup.
 
 	Panic: DELETE. Rayfield hides with its own key (K by default).
 ]]
@@ -30,10 +26,14 @@ if not LocalPlayer then
 end
 
 local camera = workspace.CurrentCamera
-workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-	if workspace.CurrentCamera then
-		camera = workspace.CurrentCamera
-	end
+local connections = {}
+local function connect(signal, callback)
+	local connection = signal:Connect(callback)
+	connections[#connections + 1] = connection
+	return connection
+end
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+	camera = workspace.CurrentCamera
 end)
 
 -- ============================================================================
@@ -41,6 +41,12 @@ end)
 -- ============================================================================
 
 local CFG = {
+	targeting = {
+		ignoreTeammates = true,
+		actors = "Players + bots",
+		skipProtected = true,
+		maxDistance = 2500,
+	},
 	esp = {
 		enabled = true,
 		box = true,
@@ -50,8 +56,13 @@ local CFG = {
 		tracer = false,
 		chams = false,
 		bots = true,
-		teamCheck = true,
 		maxDistance = 2500,
+		rainbow = false,
+		rainbowChams = false,
+		rainbowPeriod = 6,
+		chamsTransparency = 0.55,
+		chamsThroughWalls = true,
+		refreshRate = 60,
 	},
 	aim = {
 		enabled = true,
@@ -62,7 +73,8 @@ local CFG = {
 		smoothness = 55,        -- 0 = raw, 100 = very soft
 		maxStep = 26,           -- pixels per tick ceiling, mouse mode
 		stick = 0.7,            -- keep-window multiplier on top of the fov
-		switchMargin = 0.22,    -- a new target must be this much closer to steal the lock
+		sticky = true,
+		preference = "Closest enemy",
 		grace = 0.55,           -- seconds the lock survives a lost target
 		part = "Head",
 		visibleOnly = true,
@@ -106,7 +118,7 @@ local STATE = {
 	point = nil,
 	lastSeen = 0,
 	lastLos = {},          -- [actor] = { t = number, ok = boolean }
-	drawing = {},          -- [actor] = { box, name, distance, health, tracer, dot }
+	drawing = {},          -- [actor] = { box, name, distance, health, tracer }
 	chams = {},            -- [actor] = Highlight
 	hitboxSizes = {},
 	held = false,
@@ -116,6 +128,10 @@ local STATE = {
 	firing = false,
 	fovCircle = nil,
 	alive = true,
+	lastCollect = -math.huge,
+	lastMaintenance = -math.huge,
+	lastVisual = -math.huge,
+	speedOriginal = {},
 }
 
 local function note(text)
@@ -142,32 +158,50 @@ local function isBot(actor)
 	return Players:GetPlayerFromCharacter(actor) == nil
 end
 
+local function teamToken(actor)
+	if not actor then return nil end
+	for _, name in ipairs({ "TeamId", "TeamID", "Team", "team" }) do
+		local value = actor:GetAttribute(name)
+		if type(value) == "number" or (type(value) == "string" and value ~= "") then
+			local token = string.lower(tostring(value))
+			if token ~= "neutral" and token ~= "ffa" and token ~= "none" and token ~= "0" then
+				return token
+			end
+		end
+	end
+	return nil
+end
+
 local function sameTeam(actor)
 	local mine = LocalPlayer.Team
-	if not CFG.esp.teamCheck or not mine or mine == "" then
-		return false
-	end
 	local plr = Players:GetPlayerFromCharacter(actor)
-	if plr then
-		return plr.Team == mine
+	if mine and not LocalPlayer.Neutral then
+		if plr and not plr.Neutral and plr.Team then
+			return plr.Team == mine
+		end
+		local tag = teamToken(actor)
+		if tag == string.lower(mine.Name) then return true end
 	end
-	local tag = actor:GetAttribute("Team") or actor:GetAttribute("team")
-	return tag ~= nil and tag == mine
+	-- Custom bot teams use attributes rather than a Player.Team object.
+	local own = teamToken(LocalPlayer.Character)
+	local theirs = teamToken(actor)
+	return own ~= nil and theirs ~= nil and own == theirs
 end
 
 local function protected(actor)
+	if actor:FindFirstChildOfClass("ForceField") then return true end
 	local hum = actor:FindFirstChildOfClass("Humanoid")
 	for _, container in ipairs({ actor, hum }) do
 		if container then
 			for name, value in pairs(container:GetAttributes()) do
 				local key = string.lower(name)
-				if value and (string.find(key, "spawn") or string.find(key, "immune") or string.find(key, "protect")) then
+				if value == true and (string.find(key, "immune") or string.find(key, "protect")) then
 					return true
 				end
 			end
 			for _, tag in ipairs(container:GetTags()) do
 				local key = string.lower(tag)
-				if string.find(key, "spawn") or string.find(key, "immune") or string.find(key, "protect") then
+				if string.find(key, "immune") or string.find(key, "protect") then
 					return true
 				end
 			end
@@ -176,11 +210,34 @@ local function protected(actor)
 	return false
 end
 
+local function worldDistance(actor)
+	local body = bodyOf(actor)
+	local own = bodyOf(LocalPlayer.Character)
+	if not body or (not own and not camera) then return math.huge end
+	return (body.Position - (own and own.Position or camera.CFrame.Position)).Magnitude
+end
+
+local function allowedActor(actor)
+	if actor == LocalPlayer.Character or not alive(actor) then return false end
+	if CFG.targeting.ignoreTeammates and sameTeam(actor) then return false end
+	local group = CFG.targeting.actors
+	if group == "Players only" and isBot(actor) then return false end
+	if group == "Bots only" and not isBot(actor) then return false end
+	return true
+end
+
+local function eligibleTarget(actor)
+	return allowedActor(actor) and worldDistance(actor) <= CFG.targeting.maxDistance
+		and (not CFG.targeting.skipProtected or not protected(actor))
+end
+
 -- ============================================================================
 -- target collection
 -- ============================================================================
 
-local function collect()
+local function collect(now)
+	if now - STATE.lastCollect < 0.2 then return end
+	STATE.lastCollect = now
 	local out, set = {}, {}
 	STATE.targets, STATE.targetSet = out, set
 
@@ -188,7 +245,7 @@ local function collect()
 		if set[actor] or actor == LocalPlayer.Character then
 			return
 		end
-		if not alive(actor) or sameTeam(actor) then
+		if not alive(actor) then
 			return
 		end
 		set[actor] = true
@@ -212,6 +269,9 @@ local function collect()
 			end
 		end
 	end
+	for actor in pairs(STATE.lastLos) do
+		if not set[actor] then STATE.lastLos[actor] = nil end
+	end
 end
 
 -- ============================================================================
@@ -233,18 +293,21 @@ local function rayClear(actor, worldPos)
 	local origin = camera.CFrame.Position
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { LocalPlayer.Character, actor, camera }
+	local ignore = { camera }
+	if LocalPlayer.Character then ignore[#ignore + 1] = LocalPlayer.Character end
+	params.FilterDescendantsInstances = ignore
 	params.IgnoreWater = true
-	return workspace:Raycast(origin, worldPos - origin, params) == nil
+	local result = workspace:Raycast(origin, worldPos - origin, params)
+	return result == nil or result.Instance:IsDescendantOf(actor)
 end
 
 -- cached for a few frames so a railing does not make the lock strobe
 local function losOk(actor, point, now)
 	local cached = STATE.lastLos[actor]
-	if cached and now - cached.t < 0.1 then
+	if cached and now - cached.t < 0.05 then
 		return cached.ok
 	end
-	local ok = (not CFG.aim.visibleOnly) or rayClear(actor, point)
+	local ok = rayClear(actor, point)
 	STATE.lastLos[actor] = { t = now, ok = ok }
 	return ok
 end
@@ -264,8 +327,11 @@ local function aimPoint(actor)
 		base = body and body.Position
 	else
 		if head and body then
-			local origin = camera.CFrame.Position
-			base = ((head.Position - origin).Magnitude <= (body.Position - origin).Magnitude)
+			local center = camera.ViewportSize / 2
+			local headScreen, bodyScreen = project(head.Position), project(body.Position)
+			local headOffset = headScreen and (headScreen - center).Magnitude or math.huge
+			local bodyOffset = bodyScreen and (bodyScreen - center).Magnitude or math.huge
+			base = (headOffset <= bodyOffset)
 				and head.Position or body.Position
 		else
 			base = (head and head.Position) or (body and body.Position)
@@ -290,62 +356,62 @@ local function screenOffset(point)
 	return (sp - camera.ViewportSize / 2).Magnitude, sp
 end
 
--- keeps the current body unless something is clearly better
-local function updateTarget(now)
-	local fov = CFG.aim.fov
-	local current = STATE.target
+local function resetTarget()
+	STATE.target, STATE.point, STATE.lastSeen = nil, nil, 0
+end
 
-	local bestActor, bestPoint, bestOffset = nil, nil, math.huge
-	for _, actor in ipairs(STATE.targets) do
-		if not protected(actor) then
-			local point = aimPoint(actor)
-			local offset = point and screenOffset(point)
-			if offset and offset <= fov and losOk(actor, point, now) then
-				if offset < bestOffset then
-					bestActor, bestPoint, bestOffset = actor, point, offset
-				end
-			end
-		end
+local function targetScore(actor, offset)
+	if CFG.aim.preference == "Closest to crosshair" then return offset end
+	if CFG.aim.preference == "Lowest health" then
+		return actor:FindFirstChildOfClass("Humanoid").Health
 	end
+	return worldDistance(actor)
+end
 
-	if current and STATE.targetSet[current] and alive(current) and not protected(current) then
-		local point = aimPoint(current)
-		local offset = point and screenOffset(point)
-		local keep = fov * (1 + CFG.aim.stick)
+local function candidate(actor, radius, now)
+	if not eligibleTarget(actor) then return nil end
+	local point = aimPoint(actor)
+	local offset = point and screenOffset(point)
+	if not offset or offset > radius then return nil end
+	return point, offset, not CFG.aim.visibleOnly or losOk(actor, point, now)
+end
 
-		if offset and offset <= keep then
-			local visible = losOk(current, point, now)
+local function updateTarget(now)
+	local current = STATE.target
+	if CFG.aim.sticky and current then
+		local point, _, visible = candidate(current, CFG.aim.fov * (1 + CFG.aim.stick), now)
+		if point then
 			if visible then
-				STATE.lastSeen = now
-			end
-
-			local stale = (now - STATE.lastSeen) > CFG.aim.grace
-			local better = bestActor and bestActor ~= current and bestOffset < offset * (1 - CFG.aim.switchMargin)
-
-			if better or (stale and bestActor) then
-				STATE.target, STATE.point = bestActor, bestPoint
-				STATE.lastSeen = now
+				STATE.point, STATE.lastSeen = point, now
+				return
+			elseif now - STATE.lastSeen <= CFG.aim.grace then
+				STATE.point = nil
 				return
 			end
-
-			-- hold the lock; only feed a point the aim may actually pull toward
-			STATE.target = current
-			STATE.point = visible and point or nil
-			return
 		end
 	end
 
-	if bestActor then
-		STATE.target, STATE.point = bestActor, bestPoint
-		STATE.lastSeen = now
-	else
-		STATE.target, STATE.point = nil, nil
+	local bestActor, bestPoint, bestScore, bestOffset = nil, nil, math.huge, math.huge
+	for _, actor in ipairs(STATE.targets) do
+		local point, offset, visible = candidate(actor, CFG.aim.fov, now)
+		if point and visible then
+			local score = targetScore(actor, offset)
+			if score < bestScore or (score == bestScore and offset < bestOffset) then
+				bestActor, bestPoint, bestScore, bestOffset = actor, point, score, offset
+			end
+		end
 	end
+	STATE.target, STATE.point = bestActor, bestPoint
+	STATE.lastSeen = bestActor and now or 0
 end
 
 local function gainFromSmoothness()
 	-- 100 -> 0.06, 0 -> 0.85, exponential so the ends feel different
 	return 0.85 * (0.0706 ^ (math.clamp(CFG.aim.smoothness, 0, 100) / 100))
+end
+
+local function frameGain(dt)
+	return 1 - (1 - gainFromSmoothness()) ^ (math.max(dt, 0) * 60)
 end
 
 local function mouseAim(point, dt)
@@ -363,9 +429,8 @@ local function mouseAim(point, dt)
 		return
 	end
 
-	local gain = gainFromSmoothness() * math.clamp(dt * 60, 0.35, 2)
-	local step = errorVector * math.clamp(gain, 0.01, 0.9)
-	local cap = CFG.aim.maxStep * math.clamp(dt * 60, 0.35, 2)
+	local step = errorVector * frameGain(dt)
+	local cap = CFG.aim.maxStep * dt * 60
 	if step.Magnitude > cap then
 		step = step.Unit * cap
 	end
@@ -390,12 +455,11 @@ local function cameraAim(point, dt)
 		return (a + math.pi) % (2 * math.pi) - math.pi
 	end
 
-	local gain = math.clamp(gainFromSmoothness() * math.clamp(dt * 60, 0.35, 2), 0.01, 0.9)
+	local gain = frameGain(dt)
 	local stepYaw = wrap(yaw - currentYaw) * gain
 	local stepPitch = wrap(pitch - currentPitch) * gain
 
-	-- never rotate more than ~22 degrees in one frame, keeps a reacquire from snapping
-	local limit = math.rad(22)
+	local limit = math.rad(360) * dt
 	stepYaw = math.clamp(stepYaw, -limit, limit)
 	stepPitch = math.clamp(stepPitch, -limit, limit)
 
@@ -415,17 +479,21 @@ end
 local lastTick = os.clock()
 
 local function aimStep()
+	if not STATE.alive then return end
 	if not camera then
+		resetTarget()
 		return
 	end
 	local now = os.clock()
 	local dt = math.clamp(now - lastTick, 0.001, 0.1)
 	lastTick = now
 
-	if not aiming() then
+	if not aiming() or UserInputService:GetFocusedTextBox() then
+		resetTarget()
 		return
 	end
 
+	collect(now)
 	updateTarget(now)
 	if STATE.point then
 		if CFG.aim.method == "Camera" then
@@ -445,7 +513,7 @@ local function crosshairPoint()
 	local best, bestOffset = nil, CFG.trigger.fovPixels
 
 	for _, actor in ipairs(STATE.targets) do
-		if not protected(actor) then
+		if eligibleTarget(actor) then
 			local point = aimPoint(actor)
 			local offset = point and screenOffset(point)
 			if offset and offset < bestOffset then
@@ -460,17 +528,18 @@ local function crosshairPoint()
 end
 
 local function click()
-	if STATE.firing then
+	if STATE.firing or not STATE.alive then
 		return
 	end
 	STATE.firing = true
 	task.spawn(function()
 		local ok = pcall(function()
+			if not STATE.alive then return end
 			mouse1press()
 			task.wait(0.025)
 			mouse1release()
 		end)
-		if not ok then
+		if not ok and STATE.alive then
 			pcall(function()
 				local vim = game:GetService("VirtualInputManager")
 				vim:SendMouseButtonEvent(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2, 0, true, game, 1)
@@ -483,7 +552,7 @@ local function click()
 end
 
 local function triggerStep()
-	if not CFG.trigger.enabled then
+	if not CFG.trigger.enabled or UserInputService:GetFocusedTextBox() then
 		return
 	end
 	local now = os.clock()
@@ -539,15 +608,33 @@ end
 
 local function destroyLayer(entry)
 	for _, object in pairs(entry) do
-		if object and object.Destroy then
+		if object then
 			pcall(function()
-				object:Destroy()
+				if object.Remove then object:Remove() else object:Destroy() end
 			end)
 		end
 	end
 end
 
-local function renderESP()
+local function visualEligible(actor)
+	return allowedActor(actor) and (CFG.esp.bots or not isBot(actor))
+		and worldDistance(actor) <= CFG.esp.maxDistance
+end
+
+local function rainbowColor(now)
+	return Color3.fromHSV((now / math.max(CFG.esp.rainbowPeriod, 0.1)) % 1, 1, 1)
+end
+
+local function pruneVisuals()
+	for actor, entry in pairs(STATE.drawing) do
+		if not STATE.targetSet[actor] or not alive(actor) then
+			destroyLayer(entry)
+			STATE.drawing[actor] = nil
+		end
+	end
+end
+
+local function renderESP(rainbow)
 	if not CFG.esp.enabled then
 		for _, entry in pairs(STATE.drawing) do
 			hideLayer(entry)
@@ -559,6 +646,7 @@ local function renderESP()
 	local center = camera.ViewportSize / 2
 
 	for _, actor in ipairs(STATE.targets) do
+		if not visualEligible(actor) then continue end
 		local entry = layerFor(actor)
 		seen[actor] = true
 
@@ -600,7 +688,7 @@ local function renderESP()
 
 		local left = bottomScreen.X - width / 2
 		local top = math.min(topScreen.Y, bottomScreen.Y)
-		local color = bot and COL.bot or COL.box
+		local color = CFG.esp.rainbow and rainbow or (bot and COL.bot or COL.box)
 
 		if CFG.esp.box and entry.box then
 			entry.box.Visible = true
@@ -614,7 +702,7 @@ local function renderESP()
 		if CFG.esp.health and entry.health then
 			local ratio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
 			entry.health.Visible = true
-			entry.health.Color = COL.health
+			entry.health.Color = CFG.esp.rainbow and rainbow or COL.health
 			entry.health.Size = Vector2.new(2, height * ratio)
 			entry.health.Position = Vector2.new(left - 6, top + (height - height * ratio))
 		elseif entry.health then
@@ -631,7 +719,7 @@ local function renderESP()
 				label = label .. " (spawn)"
 			end
 			entry.name.Visible = true
-			entry.name.Color = bot and COL.bot or COL.name
+			entry.name.Color = CFG.esp.rainbow and rainbow or (bot and COL.bot or COL.name)
 			entry.name.Text = label
 			entry.name.Position = Vector2.new(bottomScreen.X, top - 17)
 		elseif entry.name then
@@ -640,7 +728,7 @@ local function renderESP()
 
 		if CFG.esp.distance and entry.distance then
 			entry.distance.Visible = true
-			entry.distance.Color = COL.distance
+			entry.distance.Color = CFG.esp.rainbow and rainbow or COL.distance
 			entry.distance.Text = string.format("%d studs", math.floor(distance))
 			entry.distance.Position = Vector2.new(bottomScreen.X, top + height + 3)
 		elseif entry.distance then
@@ -664,23 +752,26 @@ local function renderESP()
 	end
 end
 
-local function renderChams()
+local function renderChams(rainbow)
 	local keep = {}
 	for _, actor in ipairs(STATE.targets) do
-		if CFG.esp.chams then
+		if CFG.esp.enabled and CFG.esp.chams and visualEligible(actor) then
 			keep[actor] = true
 			local highlight = STATE.chams[actor]
 			if not highlight or highlight.Parent ~= actor then
-				highlight = actor:FindFirstChild("NYX_Chams") or Instance.new("Highlight")
+				highlight = Instance.new("Highlight")
 				highlight.Name = "NYX_Chams"
-				highlight.FillColor = COL.chams
-				highlight.FillTransparency = 0.55
-				highlight.OutlineColor = COL.chams
 				highlight.OutlineTransparency = 0
-				highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				highlight.Adornee = actor
 				highlight.Parent = actor
 				STATE.chams[actor] = highlight
 			end
+			local color = CFG.esp.rainbowChams and rainbow or COL.chams
+			highlight.FillColor = color
+			highlight.OutlineColor = color
+			highlight.FillTransparency = CFG.esp.chamsTransparency
+			highlight.DepthMode = CFG.esp.chamsThroughWalls
+				and Enum.HighlightDepthMode.AlwaysOnTop or Enum.HighlightDepthMode.Occluded
 		end
 	end
 	for actor, highlight in pairs(STATE.chams) do
@@ -720,13 +811,14 @@ local function renderHitboxes(now)
 
 	local wanted = {}
 	for _, actor in ipairs(STATE.targets) do
-		for _, part in ipairs(actor:GetDescendants()) do
+		if not eligibleTarget(actor) then continue end
+		for _, part in ipairs(actor:GetChildren()) do
 			if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
 				wanted[part] = true
 				if not STATE.hitboxSizes[part] then
 					STATE.hitboxSizes[part] = part.Size
-					part.Size = part.Size * CFG.hitbox.scale
 				end
+				part.Size = STATE.hitboxSizes[part] * CFG.hitbox.scale
 			end
 		end
 	end
@@ -741,18 +833,46 @@ local function renderHitboxes(now)
 	end
 end
 
+local function applySpeed()
+	local current = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+	for hum, value in pairs(STATE.speedOriginal) do
+		if hum ~= current or not CFG.speed.enabled then
+			pcall(function() hum.WalkSpeed = value end)
+			STATE.speedOriginal[hum] = nil
+		end
+	end
+	if CFG.speed.enabled and current then
+		if not STATE.speedOriginal[current] then STATE.speedOriginal[current] = current.WalkSpeed end
+		current.WalkSpeed = CFG.speed.value
+	end
+end
+
 -- ============================================================================
 -- loops
 -- ============================================================================
 
-RunService.RenderStepped:Connect(function()
-	if not STATE.alive or not camera then
+connect(RunService.RenderStepped, function()
+	if not STATE.alive then return end
+	local now = os.clock()
+	collect(now)
+	if now - STATE.lastMaintenance >= 0.2 then
+		STATE.lastMaintenance = now
+		pruneVisuals()
+		applySpeed()
+	end
+	if not camera then
+		for _, entry in pairs(STATE.drawing) do hideLayer(entry) end
+		if STATE.fovCircle then STATE.fovCircle.Visible = false end
 		return
 	end
-	collect()
-	renderESP()
-	renderChams()
-	renderHitboxes(os.clock())
+	local visualInterval = 1 / math.clamp(CFG.esp.refreshRate, 15, 120)
+	if now - STATE.lastVisual >= visualInterval then
+		STATE.lastVisual = now
+		local rainbow = (CFG.esp.rainbow or CFG.esp.rainbowChams) and rainbowColor(now) or COL.chams
+		renderESP(rainbow)
+		renderChams(rainbow)
+	end
+	renderHitboxes(now)
 	triggerStep()
 
 	if STATE.fovCircle then
@@ -793,32 +913,79 @@ local function matches(input, target)
 	return false
 end
 
-UserInputService.InputBegan:Connect(function(input)
+connect(UserInputService.InputBegan, function(input, processed)
+	if not STATE.alive then return end
+	if input.KeyCode == Enum.KeyCode.Delete and not UserInputService:GetFocusedTextBox() then
+		if getgenv().NYX_HYPERSHOT then getgenv().NYX_HYPERSHOT.panic() end
+		return
+	end
+	if processed or UserInputService:GetFocusedTextBox() then return end
 	local key = KEY_MAP[CFG.aim.key]
 	if key and matches(input, key) then
+		resetTarget()
 		if CFG.aim.mode == "Toggle" then
 			STATE.toggled = not STATE.toggled
 		else
 			STATE.held = true
 		end
 	end
-	if input.KeyCode == Enum.KeyCode.Delete then
-		if getgenv().NYX_HYPERSHOT then
-			getgenv().NYX_HYPERSHOT.panic()
-		end
-	end
 end)
 
-UserInputService.InputEnded:Connect(function(input)
+connect(UserInputService.InputEnded, function(input)
 	local key = KEY_MAP[CFG.aim.key]
 	if key and matches(input, key) and CFG.aim.mode ~= "Toggle" then
 		STATE.held = false
+		resetTarget()
 	end
+end)
+
+connect(UserInputService.WindowFocusReleased, function()
+	STATE.held, STATE.toggled = false, false
+	resetTarget()
 end)
 
 -- ============================================================================
 -- interface
 -- ============================================================================
+
+local Rayfield
+
+local function panic()
+	if not STATE.alive then return end
+	STATE.alive = false
+	for _, connection in ipairs(connections) do connection:Disconnect() end
+	table.clear(connections)
+	resetTarget()
+	CFG.esp.enabled = false
+	CFG.aim.enabled = false
+	CFG.trigger.enabled = false
+	CFG.hitbox.enabled = false
+	restoreHitboxes()
+	CFG.speed.enabled = false
+	applySpeed()
+	for actor, entry in pairs(STATE.drawing) do
+		destroyLayer(entry)
+		STATE.drawing[actor] = nil
+	end
+	for actor, highlight in pairs(STATE.chams) do
+		pcall(function() highlight:Destroy() end)
+		STATE.chams[actor] = nil
+	end
+	if STATE.fovCircle then
+		destroyLayer({ STATE.fovCircle })
+		STATE.fovCircle = nil
+	end
+	pcall(function() RunService:UnbindFromRenderStep("NYX_Aim") end)
+	pcall(function()
+		if Rayfield and Rayfield.Destroy then Rayfield:Destroy() end
+	end)
+	if getgenv().NYX_HYPERSHOT and getgenv().NYX_HYPERSHOT.state == STATE then
+		getgenv().NYX_HYPERSHOT = nil
+	end
+	note("panic")
+end
+
+getgenv().NYX_HYPERSHOT = { config = CFG, state = STATE, panic = panic }
 
 local SOURCES = {
 	"https://raw.githubusercontent.com/SyncOfficialSpec/Rayfield_Gen_2_fanmade/refs/heads/main/source.lua",
@@ -828,6 +995,7 @@ local SOURCES = {
 
 local function loadRayfield()
 	for _, url in ipairs(SOURCES) do
+		if not STATE.alive then return nil end
 		local ok, library = pcall(function()
 			local body = game:HttpGet(url)
 			local chunk = loadstring(body)
@@ -840,7 +1008,7 @@ local function loadRayfield()
 			end
 			return value
 		end)
-		if ok and library then
+		if ok and library and type(library.CreateWindow) == "function" then
 			note("interface: " .. url)
 			return library
 		end
@@ -849,7 +1017,11 @@ local function loadRayfield()
 	return nil
 end
 
-local Rayfield = loadRayfield()
+Rayfield = loadRayfield()
+if not STATE.alive then
+	if Rayfield and Rayfield.Destroy then pcall(function() Rayfield:Destroy() end) end
+	return
+end
 
 local function buildFallback()
 	-- no library at all: keep the cheat running, just expose the config through getgenv
@@ -857,13 +1029,14 @@ local function buildFallback()
 	return nil
 end
 
+local interfaceOk, interfaceError = pcall(function()
 if Rayfield and Rayfield.CreateWindow then
 	local Window = Rayfield:CreateWindow({
 		Name = "hypershot",
 		Subtitle = "nyx",
 		Icon = 0,
 		LoadingTitle = "hypershot",
-		LoadingSubtitle = "nyx build v2",
+		LoadingSubtitle = "nyx build v3",
 		Theme = "Default",
 		ConfigurationSaving = {
 			Enabled = true,
@@ -885,7 +1058,76 @@ if Rayfield and Rayfield.CreateWindow then
 		Flag = "aim_enabled",
 		Callback = function(value)
 			CFG.aim.enabled = value
+			resetTarget()
 		end,
+	})
+
+	AimTab:CreateDropdown({
+		Name = "Targeting preference",
+		Options = { "Closest enemy", "Closest to crosshair", "Lowest health" },
+		CurrentOption = { CFG.aim.preference },
+		Flag = "aim_preference_v3",
+		Callback = function(option)
+			CFG.aim.preference = type(option) == "table" and option[1] or option
+			resetTarget()
+		end,
+	})
+	AimTab:CreateLabel("Closest enemy = world distance, inside FOV and target range")
+	AimTab:CreateToggle({
+		Name = "Sticky lock (keep first target)",
+		CurrentValue = CFG.aim.sticky,
+		Flag = "aim_sticky_lock_v3",
+		Callback = function(value)
+			CFG.aim.sticky = value
+			resetTarget()
+		end,
+	})
+	AimTab:CreateToggle({
+		Name = "Ignore teammates (all features)",
+		CurrentValue = CFG.targeting.ignoreTeammates,
+		Flag = "target_ignore_teammates_v3",
+		Callback = function(value)
+			CFG.targeting.ignoreTeammates = value
+			STATE.lastSweep = -math.huge
+			resetTarget()
+		end,
+	})
+	AimTab:CreateDropdown({
+		Name = "Target group (all features)",
+		Options = { "Players + bots", "Players only", "Bots only" },
+		CurrentOption = { CFG.targeting.actors },
+		Flag = "target_group_v3",
+		Callback = function(option)
+			CFG.targeting.actors = type(option) == "table" and option[1] or option
+			STATE.lastSweep = -math.huge
+			resetTarget()
+		end,
+	})
+	AimTab:CreateToggle({
+		Name = "Skip spawn-protected targets",
+		CurrentValue = CFG.targeting.skipProtected,
+		Flag = "target_skip_protected_v3",
+		Callback = function(value)
+			CFG.targeting.skipProtected = value
+			resetTarget()
+		end,
+	})
+	AimTab:CreateSlider({
+		Name = "Maximum target distance",
+		Range = { 50, 5000 }, Increment = 50, Suffix = "studs",
+		CurrentValue = CFG.targeting.maxDistance,
+		Flag = "target_range_v3",
+		Callback = function(value)
+			CFG.targeting.maxDistance = value
+			resetTarget()
+		end,
+	})
+	AimTab:CreateSlider({
+		Name = "Lost visibility grace",
+		Range = { 0, 1000 }, Increment = 50, Suffix = "ms",
+		CurrentValue = CFG.aim.grace * 1000,
+		Flag = "aim_grace_v3",
+		Callback = function(value) CFG.aim.grace = value / 1000 end,
 	})
 
 	AimTab:CreateDropdown({
@@ -897,6 +1139,7 @@ if Rayfield and Rayfield.CreateWindow then
 			CFG.aim.mode = type(option) == "table" and option[1] or option
 			STATE.held = false
 			STATE.toggled = false
+			resetTarget()
 		end,
 	})
 
@@ -909,6 +1152,7 @@ if Rayfield and Rayfield.CreateWindow then
 			CFG.aim.key = type(option) == "table" and option[1] or option
 			STATE.held = false
 			STATE.toggled = false
+			resetTarget()
 		end,
 	})
 
@@ -919,6 +1163,8 @@ if Rayfield and Rayfield.CreateWindow then
 		Flag = "aim_part",
 		Callback = function(option)
 			CFG.aim.part = type(option) == "table" and option[1] or option
+			STATE.lastLos = {}
+			resetTarget()
 		end,
 	})
 
@@ -960,7 +1206,7 @@ if Rayfield and Rayfield.CreateWindow then
 	})
 
 	AimTab:CreateSlider({
-		Name = "Stickiness",
+		Name = "Lock retention FOV bonus",
 		Range = { 0, 250 },
 		Increment = 5,
 		CurrentValue = math.floor(CFG.aim.stick * 100),
@@ -1097,6 +1343,48 @@ if Rayfield and Rayfield.CreateWindow then
 		end,
 	})
 
+	VisualTab:CreateSection("Rainbow and chams")
+	VisualTab:CreateToggle({
+		Name = "Rainbow ESP",
+		CurrentValue = CFG.esp.rainbow,
+		Flag = "esp_rainbow_v3",
+		Callback = function(value) CFG.esp.rainbow = value end,
+	})
+	VisualTab:CreateToggle({
+		Name = "Rainbow chams",
+		CurrentValue = CFG.esp.rainbowChams,
+		Flag = "chams_rainbow_v3",
+		Callback = function(value) CFG.esp.rainbowChams = value end,
+	})
+	VisualTab:CreateLabel("Enable ESP + Chams above to display rainbow chams")
+	VisualTab:CreateSlider({
+		Name = "Rainbow cycle time",
+		Range = { 1, 20 }, Increment = 1, Suffix = "seconds",
+		CurrentValue = CFG.esp.rainbowPeriod,
+		Flag = "rainbow_period_v3",
+		Callback = function(value) CFG.esp.rainbowPeriod = value end,
+	})
+	VisualTab:CreateSlider({
+		Name = "Chams opacity",
+		Range = { 0, 100 }, Increment = 5, Suffix = "%",
+		CurrentValue = math.floor((1 - CFG.esp.chamsTransparency) * 100 + 0.5),
+		Flag = "chams_opacity_v3",
+		Callback = function(value) CFG.esp.chamsTransparency = 1 - value / 100 end,
+	})
+	VisualTab:CreateToggle({
+		Name = "Chams through walls",
+		CurrentValue = CFG.esp.chamsThroughWalls,
+		Flag = "chams_through_walls_v3",
+		Callback = function(value) CFG.esp.chamsThroughWalls = value end,
+	})
+	VisualTab:CreateSlider({
+		Name = "Visual refresh rate",
+		Range = { 15, 120 }, Increment = 5, Suffix = "Hz",
+		CurrentValue = CFG.esp.refreshRate,
+		Flag = "esp_refresh_v3",
+		Callback = function(value) CFG.esp.refreshRate = value end,
+	})
+
 	MiscTab:CreateSection("Combat")
 
 	MiscTab:CreateToggle({
@@ -1131,6 +1419,12 @@ if Rayfield and Rayfield.CreateWindow then
 			CFG.trigger.delay = value / 1000
 		end,
 	})
+	MiscTab:CreateToggle({
+		Name = "Trigger visible only",
+		CurrentValue = CFG.trigger.visibleOnly,
+		Flag = "trigger_visible_v3",
+		Callback = function(value) CFG.trigger.visibleOnly = value end,
+	})
 
 	MiscTab:CreateSection("Player")
 
@@ -1148,14 +1442,14 @@ if Rayfield and Rayfield.CreateWindow then
 
 	MiscTab:CreateSlider({
 		Name = "Hitbox scale",
-		Range = { 10, 40 },
-		Increment = 1,
-		CurrentValue = math.floor(CFG.hitbox.scale * 10),
+		Range = { 1, 4 },
+		Increment = 0.1,
+		CurrentValue = CFG.hitbox.scale,
 		Suffix = "x",
-		Flag = "hitbox_scale",
+		Flag = "hitbox_scale_v3",
 		Callback = function(value)
-			CFG.hitbox.scale = value / 10
-			restoreHitboxes()
+			CFG.hitbox.scale = value
+			STATE.lastSweep = -math.huge
 		end,
 	})
 
@@ -1165,10 +1459,7 @@ if Rayfield and Rayfield.CreateWindow then
 		Flag = "speed_enabled",
 		Callback = function(value)
 			CFG.speed.enabled = value
-			local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-			if hum then
-				hum.WalkSpeed = value and CFG.speed.value or 16
-			end
+			applySpeed()
 		end,
 	})
 
@@ -1180,12 +1471,7 @@ if Rayfield and Rayfield.CreateWindow then
 		Flag = "speed_value",
 		Callback = function(value)
 			CFG.speed.value = value
-			if CFG.speed.enabled then
-				local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-				if hum then
-					hum.WalkSpeed = value
-				end
-			end
+			applySpeed()
 		end,
 	})
 
@@ -1208,60 +1494,13 @@ if Rayfield and Rayfield.CreateWindow then
 else
 	buildFallback()
 end
+end)
+if not interfaceOk then
+	panic()
+	error("[nyx-hypershot] interface failed: " .. tostring(interfaceError))
+end
+if not STATE.alive then return end
 
 STATE.fovCircle = drawable("Circle", { Thickness = 1.3, NumSides = 48, Filled = false, Visible = false })
 
--- ============================================================================
--- panic
--- ============================================================================
-
-local function panic()
-	STATE.alive = false
-	CFG.esp.enabled = false
-	CFG.aim.enabled = false
-	CFG.trigger.enabled = false
-	CFG.hitbox.enabled = false
-
-	restoreHitboxes()
-
-	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-	if hum then
-		hum.WalkSpeed = 16
-	end
-
-	for actor, entry in pairs(STATE.drawing) do
-		destroyLayer(entry)
-		STATE.drawing[actor] = nil
-	end
-	for actor, highlight in pairs(STATE.chams) do
-		pcall(function()
-			highlight:Destroy()
-		end)
-		STATE.chams[actor] = nil
-	end
-	if STATE.fovCircle then
-		pcall(function()
-			STATE.fovCircle:Destroy()
-		end)
-		STATE.fovCircle = nil
-	end
-	pcall(function()
-		RunService:UnbindFromRenderStep("NYX_Aim")
-	end)
-	pcall(function()
-		if Rayfield and Rayfield.Destroy then
-			Rayfield:Destroy()
-		end
-	end)
-
-	getgenv().NYX_HYPERSHOT = nil
-	note("panic")
-end
-
-getgenv().NYX_HYPERSHOT = {
-	config = CFG,
-	state = STATE,
-	panic = panic,
-}
-
-note("v2 loaded — aim is Hold + Right Mouse by default")
+note("v3 loaded — closest enemy + sticky lock; hold Right Mouse")

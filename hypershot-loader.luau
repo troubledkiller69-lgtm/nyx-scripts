@@ -1,5 +1,5 @@
 -- Hypershot — NYX loader
--- Paste this into the executor with Hypershot open. Panel is RIGHT SHIFT, panic is DELETE.
+-- Paste with Hypershot open. Rayfield panel: K; panic: DELETE.
 
 local SOURCE = "https://raw.githubusercontent.com/troubledkiller69-lgtm/nyx-scripts/main/hypershot.luau"
 
