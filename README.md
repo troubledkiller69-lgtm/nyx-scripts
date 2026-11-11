@@ -9,8 +9,11 @@ Aim assist, ESP, triggerbot, chams and a hitbox helper for **Hypershot!** (Frost
 Open the game, then run the loader:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/troubledkiller69-lgtm/bifrost-executor/main/scripts/hypershot.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/troubledkiller69-lgtm/nyx-scripts/main/hypershot.luau"))()
 ```
+
+`scripts/` mirrors into the public `nyx-scripts` repository, which is what the loadstring above pulls
+from. `scripts/hypershot-loader.luau` is the same call with error handling and a compile check.
 
 | Input | Action |
 | --- | --- |

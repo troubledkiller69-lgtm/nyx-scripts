@@ -1,7 +1,7 @@
 -- Hypershot — NYX loader
 -- Paste this into the executor with Hypershot open. Panel is RIGHT SHIFT, panic is DELETE.
 
-local SOURCE = "https://raw.githubusercontent.com/troubledkiller69-lgtm/bifrost-executor/main/scripts/hypershot.luau"
+local SOURCE = "https://raw.githubusercontent.com/troubledkiller69-lgtm/nyx-scripts/main/hypershot.luau"
 
 local ok, body = pcall(function()
 	return game:HttpGet(SOURCE)
